@@ -310,8 +310,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    let written = before.is_some_and(|b| b & (TARGET_OR_UNORDERED | COPY_DEST) != 0);
-    if !new_source && !written {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);

@@ -577,16 +577,27 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skip_hashes() -> &'static std::collections::HashSet<String> {
     // Leonida: a set, not a list. The launcher skips some 1,034 ray-tracing shaders, and every draw and dispatch
     // asks here (diagnostics builds, which are the ones played): a scan of the list for each of the pipeline's
     // shaders was ~3,000 string compares a draw, 23% of the list threads' running time in a Series X frame of
     // ~6,000 draws (profile prof2, memmove/memcmp under prepare_for, dispatch and execute_indirect).
     static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("LEONIDA_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value).into_iter().collect()
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn is_skipped_shaders(shaders: &[Arc<Shader>]) -> bool {
+    let hashes = skip_hashes();
+    !hashes.is_empty() && shaders.iter().any(|shader| hashes.contains(&shader.hash))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    let hashes = skip_hashes();
     if hashes.is_empty() {
         return None;
     }

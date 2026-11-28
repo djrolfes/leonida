@@ -75,7 +75,10 @@ fn book() -> Option<&'static Mutex<Book>> {
             }
         }
         tracing::info!(pipelines = keys.len(), shaders = shaders.len(), "title pipelines known from earlier runs");
-        let spawned = std::thread::Builder::new().name("leonida-known".into()).spawn(|| {
+        let spawned = std::thread::Builder::new()
+            .name("leonida-known".into())
+            .stack_size(16 << 20)
+            .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 flush();

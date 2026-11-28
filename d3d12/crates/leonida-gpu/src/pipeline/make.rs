@@ -89,6 +89,10 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if super::is_skipped_shaders(shaders) {
+        return Some("shader listed in LEONIDA_SKIP_PIPELINES, left out");
+    }
     None
 }
 
@@ -646,6 +650,7 @@ fn workers() -> bool {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("leonida-pipelines-{i}"))
+                .stack_size(16 << 20)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
