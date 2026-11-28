@@ -122,11 +122,13 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key.finalize().to_hex()[..32].to_owned();
         let scene_input = scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders);
+        let left_out = left_out(&shaders)
+            .or_else(|| super::library::warm_bad(&key).then_some("crashed compiler in warm (warm-bad.txt), left out"));
         Pending {
             screen,
             scene_input,
@@ -138,7 +140,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
         }

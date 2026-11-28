@@ -310,7 +310,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !new_source && before.is_none() {
+    let written = before.is_some_and(|b| b & (TARGET_OR_UNORDERED | COPY_DEST) != 0);
+    if !new_source && !written {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -1514,13 +1515,20 @@ impl Staging {
             && *GUARD.get_or_init(|| std::env::var_os("LEONIDA_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let hash_every = *HASH_EVERY.get_or_init(|| {
+                std::env::var("LEONIDA_TEX_HASH_EVERY")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(8)
+            });
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame
-                .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+            let turn = hash_every != 0
+                && frame
+                    .wrapping_add((start >> 16) as u64)
+                    .is_multiple_of(hash_every);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {

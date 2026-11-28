@@ -604,14 +604,11 @@ fn record_clamp_packed(
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -626,7 +623,10 @@ fn record_clamp_packed(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        // Only the clamped records in `dst` need to be visible to ExecuteIndirect;
+        // the `UNORDERED_ACCESS -> INDIRECT_ARGUMENT` transition orders them without
+        // a global UAV barrier (matching `batch::record`).
+        l.ResourceBarrier(&second);
     }
     true
 }

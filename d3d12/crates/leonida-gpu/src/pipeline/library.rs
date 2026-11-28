@@ -441,6 +441,8 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+/// Pipelines that crashed or hung the host compiler in `leonida warm`.
+const BAD_FILE: &str = "warm-bad.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
@@ -637,7 +639,7 @@ pub(super) fn allows_static_samplers(host: &crate::host::Host) -> bool {
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -651,10 +653,10 @@ pub(crate) fn save(now: bool) {
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // added (or when the host has no pipeline library, e.g. VKD3D-Proton):
+    // only the early and slow lists are written so subsequent launches still
+    // prewarm used pipelines during loading.
+    let bytes = if let Some(library) = library() {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -677,6 +679,11 @@ pub(crate) fn save(now: bool) {
             SAVED.store(size as u64, Ordering::Relaxed);
             size
         }
+    } else {
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        0
     };
     // Through `used`: a process that asked for none yet (`leonida shaders`)
     // must not write the earlier runs' list over with nothing.
@@ -801,6 +808,40 @@ pub(crate) fn note_time(key: &str, ms: u64) {
         // With the next save of the early list.
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
+}
+
+/// Title pipeline keys that crashed or hung the host compiler in `leonida warm`
+/// (`warm-bad.txt`). Skipped at runtime so a known compiler crash (e.g. a
+/// `dxil-spirv` / driver `SIGILL` under VKD3D-Proton) does not terminate the
+/// title. `LEONIDA_WARM_BAD=0` disables skipping them.
+fn parse_warm_bad(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn warm_bad(key: &str) -> bool {
+    static BAD: OnceLock<HashSet<String>> = OnceLock::new();
+    let set = BAD.get_or_init(|| {
+        if std::env::var_os("LEONIDA_WARM_BAD").is_some_and(|v| v == "0") {
+            return HashSet::new();
+        }
+        let listed = DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join(BAD_FILE)).ok())
+            .unwrap_or_default();
+        let set = parse_warm_bad(&listed);
+        if !set.is_empty() {
+            tracing::info!(
+                pipelines = set.len(),
+                "known-bad pipelines from warm-bad.txt left out (LEONIDA_WARM_BAD=0: try compiling them anyway)"
+            );
+        }
+        set
+    });
+    set.contains(key)
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -1008,5 +1049,15 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn parse_warm_bad_extracts_first_token_per_line() {
+        let parsed = parse_warm_bad(
+            "aaaa1111bbbb2222cccc3333dddd4444 exit code: 3\n\n  eeee5555ffff66660000777711118888 hung for 180 s\n",
+        );
+        assert!(parsed.contains("aaaa1111bbbb2222cccc3333dddd4444"));
+        assert!(parsed.contains("eeee5555ffff66660000777711118888"));
+        assert_eq!(parsed.len(), 2);
     }
 }
