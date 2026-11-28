@@ -94,6 +94,10 @@ pub(crate) const OUTPUT_ENV: &str = "LEONIDA_OUTPUT";
 /// 2160p, all 60 Hz): its last row, 3840x2160. The code that builds the mode list copies the rows, and the two
 /// checks for a 4K output look 3840x2160 up in that list.
 const OUTPUT_ROW: usize = 0x615c100;
+/// The 2560x1440 row immediately before [`OUTPUT_ROW`] (16 bytes per row: width, height, refresh, 1).
+/// Must also be lowered when `LEONIDA_OUTPUT` asks for a mode smaller than 2560x1440 (e.g. 1920x1080),
+/// otherwise the title selects 2560x1440 from this row and overflows the smaller scanout reservation.
+const OUTPUT_ROW_1440: usize = OUTPUT_ROW - 0x10;
 /// `mov ecx, 0x4000000`: the bytes reserved for the scanout buffers off Series S (Series S takes another
 /// immediate, by the `cmovne` after it).
 const SCANOUT_RESERVATION: usize = 0x247ad4a;
@@ -122,7 +126,7 @@ fn output_patches(width: u32, height: u32) -> Vec<OwnedPatch> {
     let pair = |w: u32, h: u32| [w.to_le_bytes(), h.to_le_bytes()].concat();
     let reservation = |bytes: u32| [&[0xB9][..], &bytes.to_le_bytes()].concat();
     let viewport = (OUTPUT_ROW as i64 - (SETTINGS_VIEWPORT as i64 + 8)) as i32;
-    vec![
+    let mut patches = vec![
         OwnedPatch {
             what: "output: the 3840x2160 mode row",
             rva: OUTPUT_ROW,
@@ -141,7 +145,16 @@ fn output_patches(width: u32, height: u32) -> Vec<OwnedPatch> {
             expect: vec![0xC5, 0xFB, 0x10, 0x0D, 0x10, 0xF0, 0x13, 0x05],
             new: [&[0xC5, 0xFB, 0x10, 0x0D][..], &viewport.to_le_bytes()].concat(),
         },
-    ]
+    ];
+    if width < 2560 || height < 1440 {
+        patches.push(OwnedPatch {
+            what: "output: cap the 2560x1440 mode row",
+            rva: OUTPUT_ROW_1440,
+            expect: pair(2560, 1440),
+            new: pair(width, height),
+        });
+    }
+    patches
 }
 
 /// A patch whose bytes are computed at load time.
@@ -621,5 +634,14 @@ mod tests {
         assert_eq!(render_scale_patches(0, 0.55, true).len(), 2);
         assert_eq!(render_scale_patches(0, 0.5, false).len(), 2);
     }
-}
 
+    #[test]
+    fn output_1080p_caps_1440p_mode_row() {
+        let p1080 = output_patches(1920, 1080);
+        assert_eq!(p1080.len(), 5);
+        assert_eq!(p1080[4].rva, OUTPUT_ROW_1440);
+        assert_eq!(p1080[4].expect, [2560u32.to_le_bytes(), 1440u32.to_le_bytes()].concat());
+        assert_eq!(p1080[4].new, [1920u32.to_le_bytes(), 1080u32.to_le_bytes()].concat());
+        assert_eq!(output_patches(2560, 1440).len(), 4);
+    }
+}
