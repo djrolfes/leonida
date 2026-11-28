@@ -1335,7 +1335,8 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if let Some(pages) = kernel_written(first, last) {
         written.extend(pages);
-        asked.push((first, last));
+        // Record only the requested pieces, never incidental AHEAD_GAP pages between them.
+        asked.extend_from_slice(pieces);
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -3310,44 +3311,21 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
     };
-    let has_soft = false;
-    if !has_soft {
-        // Fast path: whole range is a single committed run with no soft-aliased blocks.
-        (from..to).for_each(|block| PROTECTED.set(block));
+    if to - from == 1 {
+        // Single-block fast path: VirtualProtect returns the exact block's prior protection.
+        PROTECTED.set(from);
         if set(from, to) {
             note(g, from, to);
             return;
         }
-        (from..to).for_each(|block| PROTECTED.clear(block));
+        PROTECTED.clear(from);
     }
-    // Coalesce contiguous committed non-soft-aliased runs via VirtualQuery so a
-    // single hole or soft-aliased block inside a large range never degrades to
-    // hundreds of single-block VirtualProtect calls on Wine.
+    // Coalesce contiguous committed runs with uniform eligible protection via
+    // VirtualQuery so a hole or differently-protected page inside a large range
+    // never degrades to hundreds of single-block calls or clobbers unrelated pages.
     let mut block = from;
     while block < to {
-        if has_soft && false {
-            PROTECTED.set(block);
-            note(g, block, block + 1);
-            block += 1;
-            continue;
-        }
-        // Find end of non-soft-aliased sub-range.
-        let mut sub_end = to;
-        if has_soft {
-            let mut b = block + 1;
-            while b < to && !false {
-                b += 1;
-            }
-            sub_end = b;
-            // Try the whole non-soft-aliased sub-run in one VirtualProtect first.
-            (block..sub_end).for_each(|k| PROTECTED.set(k));
-            if set(block, sub_end) {
-                note(g, block, sub_end);
-                block = sub_end;
-                continue;
-            }
-            (block..sub_end).for_each(|k| PROTECTED.clear(k));
-        }
+        let sub_end = to;
         // Walk contiguous OS regions inside [block, sub_end).
         while block < sub_end {
             // SAFETY: plain data filled in by VirtualQuery.
@@ -3370,7 +3348,7 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
                 block = reg_end;
                 continue;
             }
-            if info.State == MEM_COMMIT && matches!(info.Protect & 0xFF, PAGE_READWRITE | PAGE_READONLY) {
+            if info.State == MEM_COMMIT && matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY) {
                 (block..reg_end).for_each(|k| PROTECTED.set(k));
                 if set(block, reg_end) {
                     note(g, block, reg_end);
