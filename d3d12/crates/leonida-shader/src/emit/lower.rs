@@ -2173,7 +2173,7 @@ impl<'a> Lower<'a> {
                                     } else if s.lds_dwords + 4 * waves + 2 <= 8192 {
                                         ping_pong_batch = 1;
                                         s.lds_dwords += 4 * waves;
-                                    } else if s.lds_dwords + 2 * waves + 1 <= 8192 {
+                                    } else {
                                         s.lds_dwords += 2 * waves;
                                     }
                                 } else if !LOCAL_WAVES.get() || s.lds_dwords + 2 * waves + 1 <= 8192 {
@@ -14313,6 +14313,9 @@ impl<'a> Lower<'a> {
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
+        // Normal block emission has finished and `out_phase` is already snapshotted;
+        // force any late exchange materialized during phi filling onto the fenced fallback.
+        self.cur_phase = None;
         let p = self.x.p;
         for (v, b) in std::mem::take(&mut self.phase_phis) {
             let zero = self.s.m.i32(0);
