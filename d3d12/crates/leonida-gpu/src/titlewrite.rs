@@ -234,6 +234,7 @@ fn in_pieces(to: usize, n: usize, same: impl Fn(usize, usize, usize) -> bool, pu
         put(at, offset, len);
         offset += len;
     }
+    crate::watch::wrote(to, n);
 }
 
 /// Places of the title's code whose stores faulted, by a hash of the address:

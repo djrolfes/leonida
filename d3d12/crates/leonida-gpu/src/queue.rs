@@ -454,6 +454,24 @@ pub(crate) fn line_on() -> bool {
     behind::on()
 }
 
+pub(crate) fn enqueued_seq() -> u64 {
+    #[cfg(windows)]
+    {
+        behind::enqueued_seq()
+    }
+    #[cfg(not(windows))]
+    0
+}
+
+pub(crate) fn current_batch_seq() -> u64 {
+    #[cfg(windows)]
+    {
+        behind::current_batch_seq()
+    }
+    #[cfg(not(windows))]
+    0
+}
+
 /// Lists in the line may have been translated ([`crate::list::thin`]).
 #[cfg(windows)]
 pub(crate) fn line_moved() {

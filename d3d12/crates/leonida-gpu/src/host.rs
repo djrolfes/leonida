@@ -6352,6 +6352,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 blame_stale(&stale);
                 relay_wait(WHY_STALE, |_| stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to)));
+                crate::watch::ask_once_end();
                 crate::watch::ask_once(ranges);
                 stale = stale_under_flights(runs);
                 if stale.is_empty() {
@@ -6362,6 +6363,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         blame_stale(&stale);
         self.settle(submitted, WHY_STALE);
+        crate::watch::ask_once_end();
         crate::watch::ask_once(ranges);
     }
 
@@ -6491,6 +6493,16 @@ impl Host {
                 let mut ranges = std::mem::take(&mut batch.ranges);
                 ranges.clear();
                 ranges.extend(batch.spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Texture(staging) = step {
+                            let (at, len) = staging.memory();
+                            if len > 0 {
+                                ranges.push((at, at.saturating_add(len)));
+                            }
+                        }
+                    }
+                }
                 ranges
             } else {
                 let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
@@ -6541,6 +6553,7 @@ impl Host {
                 let settling = std::time::Instant::now();
                 CROSS_SETTLES.fetch_add(1, Ordering::Relaxed);
                 self.settle(&mut submitted, WHY_STALE);
+                crate::watch::ask_once_end();
                 crate::watch::ask_once(&ranges);
                 settled += settling.elapsed();
             }
@@ -6594,7 +6607,7 @@ impl Host {
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
-        crate::watch::ask_once_end();
+        crate::watch::ask_once_finish();
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
@@ -7814,7 +7827,9 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        let dred = dred_on();
+        let timed = timing();
+        if !dred && !timed {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -7827,12 +7842,14 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

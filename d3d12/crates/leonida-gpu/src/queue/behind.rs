@@ -187,6 +187,7 @@ impl<W: Work> Lane<W> {
         let number = state.next;
         state.next += 1;
         state.items.push_back(Entry { number, queue, what, mark });
+        ENQUEUED_SEQ.store(state.next, std::sync::atomic::Ordering::Release);
     }
 
     /// Adds to the end of the line, and has it looked at.
@@ -361,6 +362,7 @@ impl<W: Work> Lane<W> {
             entry
         };
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
+        let mut max_num = entry.number;
         // The highest mark of what it is made of (renderer port #7).
         let mut mark = entry.mark;
         if entry.what.ask().is_some() && !entry.what.folded() && entry.what.raises() {
@@ -408,6 +410,7 @@ impl<W: Work> Lane<W> {
             match entry.what.take_along(what) {
                 Ok(run) => {
                     runs += usize::from(run);
+                    max_num = max_num.max(number);
                     mark = mark.max(theirs);
                     if waits {
                         let later = W::mark_later();
@@ -423,8 +426,12 @@ impl<W: Work> Lane<W> {
         if runs > 0 {
             let floor = self.lock().floor(entry.queue);
             entry.what.marked(mark.max(floor));
+            CURRENT_BATCH_SEQ.store(max_num.saturating_add(1), std::sync::atomic::Ordering::Release);
         }
         entry.what.go(forced);
+        if runs > 0 {
+            CURRENT_BATCH_SEQ.store(0, std::sync::atomic::Ordering::Release);
+        }
         {
             let mut state = self.lock();
             state.running = None;
@@ -681,6 +688,7 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
+                crate::watch::ask_once_end();
                 // A frame none of whose submissions came behind the list
                 // ahead of it: that goes now, so that what it uploads is there
                 // for the next; and the next frame's is recorded from here on.
@@ -708,6 +716,21 @@ impl Work for Job {
 }
 
 static LANE: Lane<Job> = Lane::new();
+
+/// Highest sequence number enqueued into the submission line (1-based: equals
+/// `state.next` after `put`). Updated with Release after each push.
+static ENQUEUED_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 1-based max sequence number of the submission batch currently executing on
+/// the `behind` thread (0 when idle or running non-submission jobs).
+static CURRENT_BATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn enqueued_seq() -> u64 {
+    ENQUEUED_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn current_batch_seq() -> u64 {
+    CURRENT_BATCH_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Submissions and presents in the line that have not been given to the host
 /// yet.

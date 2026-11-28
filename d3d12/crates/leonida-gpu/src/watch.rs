@@ -363,6 +363,12 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Enqueued submission sequence number captured right before the standing
+    /// `ahead` GetWriteWatch snapshot (`LEONIDA_ASK_EPOCH`): any subsequent
+    /// batch whose max sequence number `<= ahead_snap` was already submitted by
+    /// the title before that snapshot ran, so its covered ranges need no fresh
+    /// GetWriteWatch call.
+    ahead_snap: u64,
 }
 
 /// Read by many threads at once (a submission's refreshes run on several),
@@ -376,6 +382,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead: Ahead::new(),
     ahead_asked: 0,
     kept: false,
+    ahead_snap: 0,
 });
 
 /// Whether the page ranges asked ahead ([`Journal::ahead`]) are kept in
@@ -1110,6 +1117,14 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Whether `ask_once` reuses its standing GetWriteWatch snapshot across
+/// consecutive `behind` submission batches that were already enqueued before
+/// the snapshot ran (`LEONIDA_ASK_EPOCH=0`: disable).
+pub(crate) fn ask_epoch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_ASK_EPOCH").is_none_or(|v| v != "0"))
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
@@ -1117,9 +1132,49 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let batch_seq = crate::queue::current_batch_seq();
+    if ask_epoch() && batch_seq != 0 {
+        let reuse = {
+            let j = journal();
+            j.kept && j.ahead_snap != 0 && batch_seq <= j.ahead_snap
+        };
+        if reuse {
+            let missing: Vec<(usize, usize)> = {
+                let j = journal();
+                ranges
+                    .iter()
+                    .copied()
+                    .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
+                    .filter(|&(start, end)| !j.ahead.holds(start / PAGE, end.div_ceil(PAGE)))
+                    .collect()
+            };
+            if !missing.is_empty() {
+                ask_rest(&missing);
+            }
+            return;
+        }
+        let snap = crate::queue::enqueued_seq();
+        ask_once_end();
+        ask_ahead(ranges);
+        ask_rest(ranges);
+        let mut j = journal_mut();
+        if j.kept {
+            j.ahead_snap = snap;
+        }
+        return;
+    }
     ask_once_end();
     ask_ahead(ranges);
     ask_rest(ranges);
+}
+
+/// Ends a submission's `ask_once` window, or keeps it standing across
+/// already-enqueued `behind` batches when [`ask_epoch`] is active.
+pub(crate) fn ask_once_finish() {
+    if ask_epoch() && crate::queue::current_batch_seq() != 0 {
+        return;
+    }
+    ask_once_end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
@@ -1136,20 +1191,53 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    let alone: Vec<(usize, usize)> = ranges
+    let mut alone: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .filter(|&(first, last)| !ahead.holds(first, last))
         .collect();
-    // Those are held, and no others ([`ask_ranges`]): a range the asking
-    // ahead holds is not asked about here. (Until this asking stands such a
-    // range is another thread's to ask about, as before the submission; what
-    // it finds it notes under a number of its own.)
-    let _held = own.then(|| AskingMany::hold(alone.clone()));
+    alone.sort_unstable();
+    // Coalesce nearby missing ranges within `AHEAD_GAP` (up to `AHEAD_MAX`) so
+    // incremental `ask_epoch` fills issue merged GetWriteWatch calls instead of
+    // one syscall per small range.
+    let mut runs: Vec<[usize; 4]> = Vec::new();
+    let mut singles: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < alone.len() {
+        let first = alone[i].0;
+        let mut last = alone[i].1;
+        let mut k = i + 1;
+        while k < alone.len()
+            && alone[k].0 <= last + AHEAD_GAP
+            && last.max(alone[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(alone[k].1);
+            k += 1;
+        }
+        if k - i >= 2 {
+            runs.push([i, k, first, last]);
+        } else {
+            singles.push((first, last));
+        }
+        i = k;
+    }
+    let hold_ranges: Vec<(usize, usize)> = runs
+        .iter()
+        .map(|r| (r[2], r[3]))
+        .chain(singles.iter().copied())
+        .collect();
+    let _held = own.then(|| AskingMany::hold(hold_ranges));
     let mut written = Vec::new();
-    for (first, last) in alone {
-        // (One of those before it may hold it by now.)
+    let mut asked_runs = Vec::new();
+    for &[from_i, to_i, ..] in &runs {
+        ask_run(&alone[from_i..to_i], &mut asked_runs, &mut written);
+    }
+    for (first, last) in asked_runs {
+        ahead.add(first, last);
+    }
+    // Any piece from a split run that fell down to a singleton + original singles.
+    for &(first, last) in &alone {
         if !ahead.holds(first, last)
             && let Some(pages) = kernel_written(first, last)
         {
@@ -1192,6 +1280,7 @@ pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        j.ahead_snap = 0;
         j.ahead.clear();
     }
 }
@@ -2062,49 +2151,130 @@ fn known_holes() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_KNOWN_HOLES").is_none_or(|v| v != "0") && light())
 }
 
+/// Placeholder address ranges `[start, end)` reserved by the HLE layer
+/// (`MEM_RESERVE_PLACEHOLDER`), used as a fallback when
+/// `NtQueryVirtualMemory(MemoryRegionInformationEx)` is unavailable (e.g. Wine).
+static PLACEHOLDER_RANGES: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
+/// Set once if `NtQueryVirtualMemory(MemoryRegionInformationEx)` returns
+/// `STATUS_INVALID_INFO_CLASS` or `STATUS_NOT_IMPLEMENTED`.
+static REGION_INFO_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records a placeholder reservation `[at, at + len)` made by the runtime.
+pub fn title_memory_placeholder_reserved(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut ranges = PLACEHOLDER_RANGES.write().unwrap_or_else(|e| e.into_inner());
+    ranges.insert(at, end);
+}
+
+/// Removes or trims tracked placeholder reservations overlapping `[at, at + len)`.
+fn placeholder_ranges_freed(at: usize, len: usize) {
+    let mut ranges = PLACEHOLDER_RANGES.write().unwrap_or_else(|e| e.into_inner());
+    if ranges.is_empty() {
+        return;
+    }
+    if len == 0 {
+        ranges.remove(&at);
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut to_remove = Vec::new();
+    let mut to_insert = Vec::new();
+    if let Some((&s, &e)) = ranges.range(..=at).next_back()
+        && e > at
+    {
+        to_remove.push(s);
+        if s < at {
+            to_insert.push((s, at));
+        }
+        if e > end {
+            to_insert.push((end, e));
+        }
+    }
+    for (&s, &e) in ranges.range(at.saturating_add(1)..end) {
+        to_remove.push(s);
+        if e > end {
+            to_insert.push((end, e));
+        }
+    }
+    for s in to_remove {
+        ranges.remove(&s);
+    }
+    for (s, e) in to_insert {
+        ranges.insert(s, e);
+    }
+}
+
+fn is_tracked_placeholder(addr: usize) -> bool {
+    let ranges = PLACEHOLDER_RANGES.read().unwrap_or_else(|e| e.into_inner());
+    ranges.range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
+}
+
 /// Whether `block` lies in a placeholder: a reservation in which pages come
 /// to be only by mapping a view (or an allocation) in its place, which an
 /// ordinary commit cannot do.
+#[cfg(test)]
 fn placeholder(block: usize) -> bool {
-    /// `MEMORY_REGION_INFORMATION` (ntddk).
-    #[repr(C)]
-    #[derive(Default)]
-    struct Region {
-        allocation_base: usize,
-        allocation_protect: u32,
-        region_type: u32,
-        region_size: usize,
-        commit_size: usize,
-        partition_id: usize,
-        node_preference: usize,
+    placeholder_inner(block, false)
+}
+
+/// Like [`placeholder`], when the caller already verified `block` is uncommitted.
+fn uncommitted_placeholder(block: usize) -> bool {
+    placeholder_inner(block, true)
+}
+
+fn placeholder_inner(block: usize, known_uncommitted: bool) -> bool {
+    const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003u32 as i32;
+    if !REGION_INFO_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+        /// `MEMORY_REGION_INFORMATION` (ntddk).
+        #[repr(C)]
+        #[derive(Default)]
+        struct Region {
+            allocation_base: usize,
+            allocation_protect: u32,
+            region_type: u32,
+            region_size: usize,
+            commit_size: usize,
+            partition_id: usize,
+            node_preference: usize,
+        }
+        #[link(name = "ntdll", kind = "raw-dylib")]
+        unsafe extern "system" {
+            fn NtQueryVirtualMemory(
+                process: *mut std::ffi::c_void,
+                at: *const std::ffi::c_void,
+                class: u32,
+                out: *mut std::ffi::c_void,
+                len: usize,
+                returned: *mut usize,
+            ) -> i32;
+        }
+        // (Class 3 answers with the kind of memory in that word, not the flags.)
+        const MEMORY_REGION_INFORMATION_EX: u32 = 7;
+        const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+        let mut region = Region::default();
+        // SAFETY: the answer's room and its size.
+        let status = unsafe {
+            NtQueryVirtualMemory(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                (block * BLOCK) as *const _,
+                MEMORY_REGION_INFORMATION_EX,
+                (&raw mut region).cast(),
+                size_of::<Region>(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status >= 0 {
+            return region.region_type & PLACEHOLDER_RESERVATION != 0;
+        }
+        if matches!(status, STATUS_NOT_IMPLEMENTED | STATUS_INVALID_INFO_CLASS) {
+            REGION_INFO_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
-    #[link(name = "ntdll", kind = "raw-dylib")]
-    unsafe extern "system" {
-        fn NtQueryVirtualMemory(
-            process: *mut std::ffi::c_void,
-            at: *const std::ffi::c_void,
-            class: u32,
-            out: *mut std::ffi::c_void,
-            len: usize,
-            returned: *mut usize,
-        ) -> i32;
-    }
-    // (Class 3 answers with the kind of memory in that word, not the flags.)
-    const MEMORY_REGION_INFORMATION_EX: u32 = 7;
-    const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
-    let mut region = Region::default();
-    // SAFETY: the answer's room and its size.
-    let status = unsafe {
-        NtQueryVirtualMemory(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            (block * BLOCK) as *const _,
-            MEMORY_REGION_INFORMATION_EX,
-            (&raw mut region).cast(),
-            size_of::<Region>(),
-            std::ptr::null_mut(),
-        )
-    };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    is_tracked_placeholder(block * BLOCK) && (known_uncommitted || uncommitted_end(block) > block)
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -2405,7 +2575,7 @@ fn hot_rest() -> std::time::Duration {
     }
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *MS.get_or_init(|| {
-        std::env::var("LEONIDA_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(1000)
+        std::env::var("LEONIDA_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(60_000)
     });
     if ms == 0 || !port_guard() {
         return std::time::Duration::ZERO;
@@ -2454,7 +2624,7 @@ impl Guards {
         let rest = rest();
         let mut opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
         if opened.len() >= MANY {
-            let keep = std::time::Duration::from_millis(50).max(hot_rest() + std::time::Duration::from_millis(50));
+            let keep = std::time::Duration::from_millis(250).max(hot_rest() + std::time::Duration::from_millis(250));
             opened.retain(|_, o| o.at.elapsed() < keep);
             if opened.len() >= MANY {
                 opened.clear();
@@ -2464,7 +2634,7 @@ impl Guards {
         let now = std::time::Instant::now();
         let hot = match opened.get(&block) {
             // Written again within its rest and a little more: hotter.
-            Some(o) if !hot_rest().is_zero() && now.duration_since(o.at) < o.rest(rest) + std::time::Duration::from_millis(50) => {
+            Some(o) if !hot_rest().is_zero() && now.duration_since(o.at) < o.rest(rest) + std::time::Duration::from_millis(250) => {
                 port6_count(P6_HOT, 1);
                 o.hot.saturating_add(1).min(16)
             }
@@ -3025,6 +3195,12 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
         if !g.protected.contains(block) {
             continue; // not there, or not ours to guard
         }
+        if false {
+            // Soft-aliased GPU tiled-heap views are updated via CopyPageMappingsBatchX
+            // (`title_memory_remapped`) or DirectStorage (`pages_written`); do not
+            // VirtualProtect their hardware streaming-pool source pages on Wine.
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         g.aliased.insert(block);
@@ -3059,6 +3235,14 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     if g.protected.contains(block) {
         return true;
     }
+    if false {
+        // A soft-aliased block is a PAGE_NOACCESS placeholder in hardware: any
+        // CPU write faults into VEH -> soft_alias_materialize -> title_memory_remapped
+        // + views_mapped, so it is already write-guarded with zero VirtualProtect calls.
+        PROTECTED.set(block);
+        g.protected.insert(block);
+        return true;
+    }
     if g.left_alone(block) || g.rests(block, rest()) {
         return false;
     }
@@ -3091,7 +3275,10 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
+        VirtualProtect, VirtualQuery,
+    };
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
@@ -3123,30 +3310,84 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
     };
-    // Ahead of the protection (`PROTECTED`).
-    (from..to).for_each(|block| PROTECTED.set(block));
-    if set(from, to) {
-        note(g, from, to);
-        return;
+    let has_soft = false;
+    if !has_soft {
+        // Fast path: whole range is a single committed run with no soft-aliased blocks.
+        (from..to).for_each(|block| PROTECTED.set(block));
+        if set(from, to) {
+            note(g, from, to);
+            return;
+        }
+        (from..to).for_each(|block| PROTECTED.clear(block));
     }
-    let mut uncommitted_until = from;
-    for block in from..to {
-        // (Not one question a block of a region that is not there.)
-        if block >= uncommitted_until && set(block, block + 1) {
+    // Coalesce contiguous committed non-soft-aliased runs via VirtualQuery so a
+    // single hole or soft-aliased block inside a large range never degrades to
+    // hundreds of single-block VirtualProtect calls on Wine.
+    let mut block = from;
+    while block < to {
+        if has_soft && false {
+            PROTECTED.set(block);
             note(g, block, block + 1);
+            block += 1;
             continue;
         }
-        PROTECTED.clear(block);
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
+        // Find end of non-soft-aliased sub-range.
+        let mut sub_end = to;
+        if has_soft {
+            let mut b = block + 1;
+            while b < to && !false {
+                b += 1;
+            }
+            sub_end = b;
+            // Try the whole non-soft-aliased sub-run in one VirtualProtect first.
+            (block..sub_end).for_each(|k| PROTECTED.set(k));
+            if set(block, sub_end) {
+                note(g, block, sub_end);
+                block = sub_end;
+                continue;
+            }
+            (block..sub_end).for_each(|k| PROTECTED.clear(k));
+        }
+        // Walk contiguous OS regions inside [block, sub_end).
+        while block < sub_end {
+            // SAFETY: plain data filled in by VirtualQuery.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
-        }
-        if block < uncommitted_until {
-            g.absent.insert(block);
-            if known_holes() && placeholder(block) {
-                g.held.insert(block);
+            if n == 0 {
+                block += 1;
+                continue;
             }
+            let reg_end = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK)
+                .min(sub_end)
+                .max(block + 1);
+            if matches!(info.State, MEM_RESERVE | MEM_FREE) {
+                g.absent.insert_all(block..reg_end);
+                if known_holes() && uncommitted_placeholder(block) {
+                    g.held.insert_all(block..reg_end);
+                }
+                block = reg_end;
+                continue;
+            }
+            if info.State == MEM_COMMIT && matches!(info.Protect & 0xFF, PAGE_READWRITE | PAGE_READONLY) {
+                (block..reg_end).for_each(|k| PROTECTED.set(k));
+                if set(block, reg_end) {
+                    note(g, block, reg_end);
+                } else {
+                    // Fallback per-block only if VirtualProtect unexpectedly rejected part of the run.
+                    for k in block..reg_end {
+                        if set(k, k + 1) {
+                            note(g, k, k + 1);
+                        } else {
+                            PROTECTED.clear(k);
+                        }
+                    }
+                }
+                block = reg_end;
+                continue;
+            }
+            block = reg_end;
         }
     }
 }
@@ -3251,6 +3492,10 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         PUBLISHED.clear(block);
     }
     let one = |block: usize| {
+        if false {
+            PROTECTED.clear(block);
+            return;
+        }
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe {
@@ -3267,7 +3512,18 @@ fn unguard(g: &Guards, blocks: &[usize]) {
     if blocks.len() < 2 || !unguard_runs() {
         blocks.iter().copied().for_each(one);
     } else {
-        let mut sorted = blocks.to_vec();
+        let mut sorted: Vec<usize> = blocks
+            .iter()
+            .copied()
+            .filter(|&block| {
+                if false {
+                    PROTECTED.clear(block);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         sorted.sort_unstable();
         sorted.dedup();
         let mut i = 0;
@@ -3331,6 +3587,7 @@ pub fn writing(at: usize, len: usize) {
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    wrote(at, len);
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
@@ -3810,6 +4067,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    wrote(at, len);
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -3845,6 +4103,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 pub fn title_memory_freed(at: usize, len: usize) {
     // (`LEONIDA_WC_NO_BACK`: write-combined regions in it are forgotten.)
     crate::shadow::write_combined_freed(at, len);
+    placeholder_ranges_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
@@ -3965,6 +4224,13 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && (ours.is_none() || r.ExceptionInformation[0] == WRITE)
+            && false
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
