@@ -73,14 +73,16 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// Cross-block CSE of read-only SRV loads (`rawBufferLoad`/`bufferLoad`/`textureLoad`/
+/// explicit-LOD `sample*` on non-UAV annotated handles) in modules with no global writes.
+pub const SRV_CSE: u32 = 512;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | GUARDS | CHAINS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | GUARDS | CHAINS | SRV_CSE;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`LEONIDA_SHADER_OPT=511` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// The passes that run when nothing says which: every one but [`WIDE`] and
+/// [`SRV_CSE`] (`LEONIDA_SHADER_OPT=1023` asks for every pass).
+pub const DEFAULT: u32 = ALL & !(WIDE | SRV_CSE);
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -242,7 +244,7 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS | GUARDS | CHAINS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | GUARDS | CHAINS | SRV_CSE) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
@@ -713,8 +715,55 @@ impl Module {
         }
     }
 
+    /// Whether any reached block performs a global UAV store or atomic.
+    fn has_global_writes(&self) -> bool {
+        let reached = self.reached();
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            for &i in &blk.body {
+                if let Op::Call(f, _) = &self.insts[i as usize].op {
+                    let name = self.funcs[*f as usize].name.as_str();
+                    let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                    if name.starts_with("bufferStore")
+                        || name.starts_with("rawBufferStore")
+                        || name.starts_with("textureStore")
+                        || name.starts_with("atomicBinOp")
+                        || name.starts_with("atomicCompareExchange")
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `h` is a `dx.op.annotateHandle` whose resource class is non-UAV
+    /// (`kind & 0x1000 == 0`).
+    fn is_srv_handle(&self, h: V) -> bool {
+        let V::Inst(a) = h else { return false };
+        let Op::Call(f, args) = &self.insts[a as usize].op else {
+            return false;
+        };
+        if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+            return false;
+        }
+        let Some(&V::Const(props)) = args.get(2) else {
+            return false;
+        };
+        let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
+            return false;
+        };
+        let Some(&first) = fields.first() else {
+            return false;
+        };
+        matches!(self.consts[first as usize].1, Const::Int(kind) if kind & 0x1000 == 0)
+    }
+
     /// What kind of instruction `i` is for merging.
-    fn class(&self, effects: &[Effect], i: u32) -> Effect {
+    fn class(&self, effects: &[Effect], i: u32, pure_srv: bool) -> Effect {
         match &self.insts[i as usize].op {
             Op::Bin(..)
             | Op::Cast(..)
@@ -738,7 +787,24 @@ impl Module {
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
             Op::Phi(_) => Effect::Lanes,
-            Op::Call(f, _) => effects[*f as usize],
+            Op::Call(f, args) => {
+                let e = effects[*f as usize];
+                if e == Effect::Reads && pure_srv {
+                    let name = self.funcs[*f as usize].name.as_str();
+                    let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                    if (name.starts_with("rawBufferLoad")
+                        || name.starts_with("bufferLoad")
+                        || name.starts_with("textureLoad")
+                        || name.starts_with("sampleLevel")
+                        || name.starts_with("sampleGrad")
+                        || name.starts_with("sampleCmpLevelZero"))
+                        && args.get(1).is_some_and(|&h| self.is_srv_handle(h))
+                    {
+                        return Effect::Pure;
+                    }
+                }
+                e
+            }
         }
     }
 
@@ -776,6 +842,7 @@ impl Module {
             return false;
         }
         let effects = self.effects();
+        let pure_srv = (passes & SRV_CSE != 0) && !self.has_global_writes();
         let tree = self.dominator_tree();
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
@@ -913,7 +980,7 @@ impl Module {
                     changed = true;
                     continue;
                 }
-                let class = self.class(&effects, i);
+                let class = self.class(&effects, i, pure_srv);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
@@ -2677,5 +2744,92 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn srv_cse_merges_across_blocks_only_without_global_writes_or_uav_bit() {
+        let make = |kind_bits: u32, with_store: bool| {
+            let mut m = Module::default();
+            let i8t = m.int(8);
+            let i32t = m.int(32);
+            let voidt = m.void();
+            let ptr_i8 = m.ptr(i8t);
+            let handle = m.named_struct("dx.types.Handle", vec![ptr_i8]);
+            let props = m.named_struct("dx.types.ResourceProperties", vec![i32t, i32t]);
+            let res_ret = m.named_struct("dx.types.ResRet.i32", vec![i32t, i32t, i32t, i32t, i32t]);
+
+            let ty_ann = m.func_ty(handle, vec![i32t, handle, props]);
+            let f_ann = m.function("dx.op.annotateHandle", ty_ann, Some(Attr::ReadNone), false);
+            let ty_load = m.func_ty(res_ret, vec![i32t, handle, i32t, i32t, i8t, i32t]);
+            let f_load = m.function("dx.op.rawBufferLoad.i32", ty_load, Some(Attr::ReadOnly), false);
+            let ty_store = m.func_ty(voidt, vec![i32t, handle, i32t, i32t, i32t, i32t, i32t, i32t, i8t, i32t]);
+            let f_store = m.function("dx.op.rawBufferStore.i32", ty_store, Some(Attr::NoUnwind), false);
+            let ty_in = m.func_ty(i32t, vec![i32t, i32t]);
+            let f_in = m.function("dx.op.threadId.i32", ty_in, Some(Attr::ReadNone), false);
+            let ty_out = m.func_ty(voidt, vec![i32t, i32t]);
+            let f_out = m.function("dx.op.storeOutput.i32", ty_out, Some(Attr::NoUnwind), false);
+
+            let b0 = m.new_block();
+            let b1 = m.new_block();
+            let b2 = m.new_block();
+
+            let zero = m.i32(0);
+            let raw_h = m.undef(handle);
+            let k_bits = m.i32(kind_bits);
+            let p_val = m.aggregate(props, &[k_bits, zero]);
+            let op_ann = m.i32(216);
+            let h = m.call(b0, f_ann, vec![op_ann, raw_h, p_val]);
+            let op_in = m.i32(93);
+            let tid = m.call(b0, f_in, vec![op_in, zero]);
+            let cond = m.cmp(b0, pred::NE, tid, zero);
+            let op_load = m.i32(139);
+            let mask1 = m.int_const(i8t, 1);
+            let align4 = m.i32(4);
+            let r0 = m.call(b0, f_load, vec![op_load, h, zero, zero, mask1, align4]);
+            let v0 = m.extract(b0, r0, 0);
+            if with_store {
+                let op_store = m.i32(140);
+                m.call(b0, f_store, vec![op_store, h, zero, zero, v0, v0, v0, v0, mask1, align4]);
+            }
+            m.terminate(b0, Term::CondBr(cond, b1, b2));
+
+            let r1 = m.call(b1, f_load, vec![op_load, h, zero, zero, mask1, align4]);
+            let v1 = m.extract(b1, r1, 0);
+            let sum = m.bin(b1, Bin::Add, v0, v1);
+            let op_out = m.i32(5);
+            m.call(b1, f_out, vec![op_out, sum]);
+            m.terminate(b1, Term::Br(b2));
+
+            m.terminate(b2, Term::Ret);
+            m
+        };
+        let count_loads = |m: &Module| -> usize {
+            m.blocks
+                .iter()
+                .flat_map(|b| b.body.iter())
+                .filter(|&&i| matches!(m.insts[i as usize].op, Op::Call(f, _) if m.funcs[f as usize].name == "dx.op.rawBufferLoad.i32"))
+                .count()
+        };
+
+        // Read-only SRV without global writes: second load in b1 is eliminated.
+        let mut srv = make(11, false);
+        assert_eq!(count_loads(&srv), 2);
+        srv.optimise(DEFAULT | SRV_CSE);
+        assert_eq!(count_loads(&srv), 1, "SRV load in dominated block must be CSE'd");
+
+        // Without SRV_CSE: stays 2.
+        let mut srv_off = make(11, false);
+        srv_off.optimise(DEFAULT);
+        assert_eq!(count_loads(&srv_off), 2);
+
+        // With UAV bit (0x1000): must NOT be CSE'd across blocks.
+        let mut uav = make(11 | 0x1000, false);
+        uav.optimise(DEFAULT | SRV_CSE);
+        assert_eq!(count_loads(&uav), 2, "UAV handle must not be CSE'd across blocks");
+
+        // With global store in module: must NOT be CSE'd across blocks.
+        let mut written = make(11, true);
+        written.optimise(DEFAULT | SRV_CSE);
+        assert_eq!(count_loads(&written), 2, "module with global store must not CSE loads");
     }
 }

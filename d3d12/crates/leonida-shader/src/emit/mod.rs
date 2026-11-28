@@ -1601,7 +1601,8 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("511")), all);
+        assert_eq!(parse_shader_opt(Some("511")), 511);
+        assert_eq!(parse_shader_opt(Some("1023")), all);
         assert_eq!(parse_shader_opt(Some("191")), 191, "the passes of the builds before the chains");
         assert_eq!(parse_shader_opt(Some("63")), 63, "the passes of the builds before the guards");
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);

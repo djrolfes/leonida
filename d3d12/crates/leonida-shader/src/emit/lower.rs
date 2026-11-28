@@ -466,6 +466,14 @@ struct Lower<'a> {
     /// exchanges of their own ([`exchange_sites`]), how many are taken, the console waves of a
     /// group, and per IR block whether a thread can run it more than once ([`in_cycle`]).
     fresh_pairs: (u32, u32, u32),
+    /// With `exchange`: alternating ping-pong batch size (0 = off, 1 or 2 pairs per phase),
+    /// console waves per group, and SSA phase (0 or 1) carried across IR blocks.
+    ping_pong_batch: u32,
+    ping_pong_waves: u32,
+    phase_phis: Vec<(V, usize)>,
+    phase_phi_of: Vec<Option<V>>,
+    out_phase: Vec<Option<V>>,
+    cur_phase: Option<V>,
     cyclic: Vec<bool>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
@@ -1550,12 +1558,21 @@ thread_local! {
 }
 
 /// The bits of [`super::rdna`] that count on this host.
+/// On AMD RDNA all bits default on (`LEONIDA_RDNA_FLOAT` filters them); on other
+/// hosts they default off unless `LEONIDA_RDNA_FLOAT` is explicitly set in the
+/// environment (e.g. `MED3`/`LEGACY`/`MAX_MIN` on NVIDIA).
 pub(super) fn host_rdna() -> u32 {
     #[cfg(test)]
     if let Some(bits) = TEST_RDNA.get() {
         return bits;
     }
-    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+    static EXPLICIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let explicit = *EXPLICIT.get_or_init(|| std::env::var_os("LEONIDA_RDNA_FLOAT").is_some());
+    if explicit || HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) {
+        super::rdna_float()
+    } else {
+        0
+    }
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -1601,6 +1618,30 @@ thread_local! {
     pub(super) static TEST_GROUP_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// A test's choice for [`exchange_sites`], for its thread only.
     pub(super) static TEST_EXCHANGE_SITES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether in-loop wave64 exchanges alternate between two LDS buffers (`LEONIDA_EXCHANGE_PINGPONG`,
+/// on unless `0`), cutting two group barriers per exchange down to one (and four to one for
+/// two-value exchanges like guarded `v_readfirstlane_b32`).
+fn ping_pong_on() -> bool {
+    #[cfg(test)]
+    if TEST_EXCHANGE_SITES.get() == Some(0) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_EXCHANGE_PINGPONG").is_none_or(|v| v != "0"))
+}
+
+/// Whether 1-D compute threadgroups (`threads[1] == 1 && threads[2] == 1`) skip the entry LDS
+/// counter + barrier + atomic (`LEONIDA_FLAT_1D`, on unless `0`), using consecutive flat thread
+/// IDs per host wave directly.
+fn flat_1d_on() -> bool {
+    #[cfg(test)]
+    if TEST_THREAD_TICKET.get().is_some() {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_FLAT_1D").is_none_or(|v| v != "0"))
 }
 
 /// Whether buffer loads of read-only views at an address the lanes hold alike count as the same
@@ -2026,6 +2067,8 @@ impl<'a> Lower<'a> {
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         let mut fresh_pairs = (0u32, 0u32, 0u32);
+        let mut ping_pong_batch = 0u32;
+        let mut ping_pong_waves = 0u32;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
@@ -2122,10 +2165,18 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 let waves = group.div_ceil(64);
-                                // (each host wave on its own, `with_local_waves`, gives and
-                                // takes nothing through LDS: no dwords where a program with all
-                                // of D3D12's 32 KiB of its own has not got them)
-                                if !LOCAL_WAVES.get() || s.lds_dwords + 2 * waves + 1 <= 8192 {
+                                ping_pong_waves = waves;
+                                if group > 32 && !LOCAL_WAVES.get() && ping_pong_on() {
+                                    if s.lds_dwords + 8 * waves + 2 <= 8192 {
+                                        ping_pong_batch = 2;
+                                        s.lds_dwords += 8 * waves;
+                                    } else if s.lds_dwords + 4 * waves + 2 <= 8192 {
+                                        ping_pong_batch = 1;
+                                        s.lds_dwords += 4 * waves;
+                                    } else if s.lds_dwords + 2 * waves + 1 <= 8192 {
+                                        s.lds_dwords += 2 * waves;
+                                    }
+                                } else if !LOCAL_WAVES.get() || s.lds_dwords + 2 * waves + 1 <= 8192 {
                                     s.lds_dwords += 2 * waves;
                                 }
                                 if group > 32 {
@@ -2195,7 +2246,8 @@ impl<'a> Lower<'a> {
             // 32 KiB: the title's culling program of 1,024 threads) takes its console threads
             // from the flat id, as a host does that gives each wave a run of consecutive ids (it
             // is only the other shapes, whose waves are tiles, that the counter is for).
-            let no_room = s.lds_dwords >= 8192 && cs.threads[1] == 1 && cs.threads[2] == 1;
+            let is_1d = cs.threads[1] == 1 && cs.threads[2] == 1;
+            let no_room = (s.lds_dwords >= 8192 || flat_1d_on()) && is_1d;
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 if no_room {
@@ -2435,6 +2487,12 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             fresh_pairs,
+            ping_pong_batch,
+            ping_pong_waves,
+            phase_phis: Vec::new(),
+            phase_phi_of: vec![None; p.blocks.len()],
+            out_phase: vec![None; p.blocks.len()],
+            cur_phase: None,
             cyclic: if fresh_pairs.0 > 0 { in_cycle(p) } else { Vec::new() },
             halves,
             ticket,
@@ -3156,6 +3214,19 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+            if self.ping_pong_batch > 0 {
+                let preds = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter(|&&q| self.block[q].is_some())
+                    .count();
+                if preds >= 2 {
+                    let blk = self.block[b].expect("reachable");
+                    let phi = self.s.m.phi(blk, self.s.t.i32);
+                    self.phase_phi_of[b] = Some(phi);
+                    self.phase_phis.push((phi, b));
+                }
+            }
         }
         self.cur = self.s.entry;
         self.hoist_lds_inits();
@@ -3181,6 +3252,15 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+            if self.ping_pong_batch > 0 {
+                self.cur_phase = Some(if let Some(phi) = self.phase_phi_of[b] {
+                    phi
+                } else if preds.len() == 1 {
+                    self.out_phase[preds[0]].unwrap_or_else(|| self.s.m.i32(0))
+                } else {
+                    self.s.m.i32(0)
+                });
+            }
             self.block_phis(b);
             if self.twin.is_some() {
                 self.swap_lanes();
@@ -3217,6 +3297,9 @@ impl<'a> Lower<'a> {
             }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            if self.ping_pong_batch > 0 {
+                self.out_phase[b] = self.cur_phase;
+            }
         }
         self.fill_phis()?;
         // (the paired form: the other lane's joins too; filling one lane's can ask for lane
@@ -5284,6 +5367,44 @@ impl<'a> Lower<'a> {
                 })
                 .collect();
         }
+        if self.ping_pong_batch > 0 && at == self.cur && let Some(mut phase) = self.cur_phase {
+            let base_pair = self.exchange_pair(slot);
+            let waves2 = 2 * self.ping_pong_waves;
+            let stride = self.s.m.i32(waves2 * self.ping_pong_batch);
+            let mut out = Vec::with_capacity(mine.len());
+            for chunk in mine.chunks(self.ping_pong_batch as usize) {
+                let phase_off = self.s.m.bin(at, Bin::Mul, phase, stride);
+                let group_base = self.s.m.bin(at, Bin::Add, base_pair, phase_off);
+                let mut pairs = Vec::with_capacity(chunk.len());
+                for (k, &m) in chunk.iter().enumerate() {
+                    let pair = if k == 0 {
+                        group_base
+                    } else {
+                        let off = self.s.m.i32(waves2 * k as u32);
+                        self.s.m.bin(at, Bin::Add, group_base, off)
+                    };
+                    let index = self.s.m.bin(at, Bin::Add, pair, half);
+                    let ptr = self.s.m.element(at, lds, index);
+                    self.s.m.store(at, ptr, m);
+                    pairs.push(pair);
+                }
+                self.group_sync(at);
+                for pair in pairs {
+                    let k1 = self.s.m.bin(at, Bin::Add, pair, one);
+                    let p0 = self.s.m.element(at, lds, pair);
+                    let p1 = self.s.m.element(at, lds, k1);
+                    out.push((self.s.m.load(at, p0), self.s.m.load(at, p1)));
+                }
+                phase = self.s.m.bin(at, Bin::Xor, phase, one);
+            }
+            self.cur_phase = Some(phase);
+            return out;
+        }
+        if self.ping_pong_batch > 0 {
+            // Rare out-of-band insertion (`scc_some` into an already-lowered block):
+            // fence before reusing pair 0 in case a prior ping-pong read is still in flight.
+            self.group_sync(at);
+        }
         mine.iter()
             .map(|&m| {
                 // the pair of dwords of this thread's console wave: its half's, then both
@@ -5319,11 +5440,12 @@ impl<'a> Lower<'a> {
         }
         let slot = self.exchange.as_ref()?.0;
         let pair = self.exchange_pair(slot);
+        let shared = if self.ping_pong_batch > 0 { 2 * self.ping_pong_batch } else { 1 };
         self.fresh_pairs.1 += n;
         Some(
             (0..n)
                 .map(|k| {
-                    let off = self.s.m.i32(2 * waves * (taken + k + 1));
+                    let off = self.s.m.i32(2 * waves * (shared + taken + k));
                     self.s.m.bin(at, Bin::Add, pair, off)
                 })
                 .collect(),
@@ -10136,9 +10258,17 @@ impl<'a> Lower<'a> {
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let here = self.cur;
                     let fresh = self.fresh_pairs_for(here, 1);
+                    let use_pp = fresh.is_none() && self.ping_pong_batch > 0 && self.cur_phase.is_some();
                     let k = match &fresh {
                         // (the dword a lane gives is the pair's first: both halves read it)
                         Some(pairs) => pairs[0],
+                        None if use_pp => {
+                            let phase = self.cur_phase.unwrap();
+                            let base_pair = self.exchange_pair(slot);
+                            let stride = self.s.m.i32(2 * self.ping_pong_waves * self.ping_pong_batch);
+                            let phase_off = self.s.m.bin(here, Bin::Mul, phase, stride);
+                            self.s.m.bin(here, Bin::Add, base_pair, phase_off)
+                        }
                         None => self.exchange_pair(slot),
                     };
                     let at = self.begin_guarded(Some(is));
@@ -10150,7 +10280,11 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    if fresh.is_none() {
+                    if use_pp {
+                        let one = self.s.m.i32(1);
+                        let phase = self.cur_phase.unwrap();
+                        self.cur_phase = Some(self.s.m.bin(c2, Bin::Xor, phase, one));
+                    } else if fresh.is_none() {
                         self.group_sync(c2);
                     }
                     return int(self, r);
@@ -14180,6 +14314,17 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        for (v, b) in std::mem::take(&mut self.phase_phis) {
+            let zero = self.s.m.i32(0);
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let x = self.out_phase[q].unwrap_or(zero);
+                incoming.push((x, qb));
+            }
+            self.s.m.set_phi(v, incoming);
+        }
         // Lane-mask joins first (what an edge brings may ask for more joins,
         // of masks and of numbers): each edge's mask as the structure
         // tracked it, a constant or a scalar-built one included.
