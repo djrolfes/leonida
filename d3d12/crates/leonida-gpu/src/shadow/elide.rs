@@ -32,8 +32,11 @@
 //! and lands it (the fork marks the hashes stale instead, and loses those bytes;
 //! that Leonida's compare heals is read from `Host::card_before`, not measured).
 
-use super::{Arc, CARDED, EXACT, LOOSE, Shadow, WINDOW, buffers_read};
-use std::sync::atomic::{AtomicU64, Ordering};
+use super::{Arc, EXACT, LOOSE, Shadow, WINDOW, buffers_read};
+use std::sync::{
+    RwLock, Weak,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 
 /// The state of a copy ([`Shadow::elide`]).
 pub(super) const OBSERVING: u8 = 0;
@@ -96,6 +99,23 @@ fn min_bytes() -> u64 {
 /// The lowest start and the highest end of copies that are watched (`[0, 0]`: none), to let the
 /// readers that are not near one pass without a lock.
 static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Compact index of non-demoted watched copies (`(start, end, id, weak)`).
+/// Avoids locking `CARDED` and upgrading thousands of weak pointers on every `Step::Copy` / `Step::Fill`.
+static WATCHED: RwLock<Vec<(u64, u64, u64, Weak<Shadow>)>> = RwLock::new(Vec::new());
+static WATCHED_LEN: AtomicUsize = AtomicUsize::new(0);
+
+fn watched_remove(id: u64) {
+    if WATCHED_LEN.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut list = WATCHED.write().unwrap_or_else(|e| e.into_inner());
+    let before = list.len();
+    list.retain(|&(_, _, eid, ref w)| eid != id && w.strong_count() > 0);
+    if list.len() != before {
+        WATCHED_LEN.store(list.len(), Ordering::Relaxed);
+    }
+}
 
 /// Promoted copies, their bytes, demotions so far, and the declarations and bytes skipped since the last line.
 static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -218,19 +238,25 @@ fn has_overlap(start: u64, len: u64, own: u64) -> bool {
 
 /// Copies watched, other than `skip`, that hold some of `[start, start + len)`, sticky demoted.
 fn demote_overlapping(start: u64, len: u64, skip: u64, why: &'static str) {
-    let (lo, hi) = (BOUNDS[0].load(Ordering::Relaxed), BOUNDS[1].load(Ordering::Relaxed));
-    let end = start.saturating_add(len);
-    if hi == 0 || start >= hi || end <= lo || len == 0 {
+    if WATCHED_LEN.load(Ordering::Relaxed) == 0 || len == 0 {
         return;
     }
-    let copies: Vec<Arc<Shadow>> = {
-        let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-        carded
-            .values()
-            .filter_map(std::sync::Weak::upgrade)
-            .filter(|s| s.id != skip && s.start < end && s.start.saturating_add(s.len) > start)
-            .collect()
-    };
+    let (lo, hi) = (BOUNDS[0].load(Ordering::Relaxed), BOUNDS[1].load(Ordering::Relaxed));
+    let end = start.saturating_add(len);
+    if hi == 0 || start >= hi || end <= lo {
+        return;
+    }
+    let mut copies: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let watched = WATCHED.read().unwrap_or_else(|e| e.into_inner());
+        for &(s, e, id, ref weak) in watched.iter() {
+            if id != skip && s < end && e > start {
+                if let Some(shadow) = weak.upgrade() {
+                    copies.push(shadow);
+                }
+            }
+        }
+    }
     for shadow in copies {
         shadow.elide_demote(why);
     }
@@ -296,13 +322,17 @@ pub(crate) fn log(frames: f64) {
 
 impl Shadow {
     /// A new copy (a title buffer's, in the card's memory): the bytes of the ones that are watched are noted.
-    pub(super) fn elide_note_bounds(&self) {
+    pub(super) fn elide_note_bounds(self: &Arc<Self>) {
         if !enabled() || self.window || self.card.is_none() || self.len < min_bytes() {
             return;
         }
         let end = self.start.saturating_add(self.len);
         let _ = BOUNDS[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(if cur == 0 { self.start } else { cur.min(self.start) }));
         BOUNDS[1].fetch_max(end, Ordering::Relaxed);
+        let mut list = WATCHED.write().unwrap_or_else(|e| e.into_inner());
+        list.retain(|(_, _, _, w)| w.strong_count() > 0);
+        list.push((self.start, end, self.id, Arc::downgrade(self)));
+        WATCHED_LEN.store(list.len(), Ordering::Relaxed);
     }
 
     /// Whether the declaration of shaders' writes here is left out: the copy is promoted and the elision on.
@@ -320,6 +350,9 @@ impl Shadow {
     /// Out of the elision for good; the copy is declared and compared as any.
     pub(super) fn elide_demote(&self, why: &'static str) {
         let was = self.elide.swap(DEMOTED, Ordering::AcqRel);
+        if was != DEMOTED {
+            watched_remove(self.id);
+        }
         if was == PROMOTED {
             STATS[0].fetch_sub(1, Ordering::Relaxed);
             STATS[1].fetch_sub(self.len, Ordering::Relaxed);
@@ -387,6 +420,9 @@ impl Shadow {
 
     /// Statistics when a copy goes.
     pub(super) fn elide_gone(&self) {
+        if self.elide.load(Ordering::Relaxed) != DEMOTED {
+            watched_remove(self.id);
+        }
         if self.elide.load(Ordering::Relaxed) == PROMOTED {
             STATS[0].fetch_sub(1, Ordering::Relaxed);
             STATS[1].fetch_sub(self.len, Ordering::Relaxed);
