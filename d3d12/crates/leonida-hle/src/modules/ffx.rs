@@ -230,7 +230,7 @@ type Create = extern "system" fn(*mut *mut c_void, *mut Header, *const c_void) -
 /// DLL takes as they are, and for what does not read as two sizes.
 fn sizes_to_stand_in(render: [u32; 2], upscale: [u32; 2]) -> Option<([u32; 2], [u32; 2])> {
     let size = |s: [u32; 2]| (1..=16384).contains(&s[0]) && (1..=16384).contains(&s[1]);
-    (size(render) && size(upscale) && upscale != SHIPPED.1).then_some(SHIPPED)
+    (size(render) && size(upscale) && (render != SHIPPED.0 || upscale != SHIPPED.1)).then_some(SHIPPED)
 }
 
 /// `ffxCreateContext` while the dispatch is ours ([`dispatch`]: DLSS or the stretch).
@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(offset_of!(CreateUpscale, max_upscale), 28);
         assert_eq!(sizes_to_stand_in([2560, 1440], [3840, 2160]), Some(SHIPPED));
         assert_eq!(sizes_to_stand_in([1280, 720], [1920, 1080]), None);
-        assert_eq!(sizes_to_stand_in([960, 540], [1920, 1080]), None);
+        assert_eq!(sizes_to_stand_in([960, 540], [1920, 1080]), Some(SHIPPED));
         // not sizes: left as it is
         assert_eq!(sizes_to_stand_in([0, 0], [3840, 2160]), None);
         assert_eq!(sizes_to_stand_in([2560, 1440], [0x7fff_0000, 2160]), None);
